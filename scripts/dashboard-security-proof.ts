@@ -8,6 +8,8 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 
+import ts from "typescript";
+
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
@@ -57,7 +59,9 @@ const CDP_COMMAND_MS = 5_000;
 // pins the constant against an accidental edit and is not evidence that the
 // deadline was fitted to data.
 // browser_debugger_target_readiness_receipt_present_and_numeric prints the
-// governed interval on every run. Until hosted runs have accumulated it, the
+// governed interval from a finally, so a run that expires this deadline prints
+// it too, and that rejection carries the same elapsed interval and attempt
+// count to the process surface. Until hosted runs have accumulated it, the
 // hosted readiness this deadline is meant to cover stays unmeasured.
 const DEBUGGER_TARGET_DERIVATION = {
   measuredInterval: "spawn_to_devtools_active_port",
@@ -314,7 +318,7 @@ type TimeoutStage =
   | "debugger_target";
 
 export class ProofTimeoutError extends Error {
-  constructor(readonly stage: TimeoutStage, detail?: string, readonly elapsedMs?: number) {
+  constructor(readonly stage: TimeoutStage, detail?: string, readonly elapsedMs?: number, readonly attempts?: number) {
     super(detail ? `proof_timeout:${stage}:${detail}` : `proof_timeout:${stage}`);
     this.name = "ProofTimeoutError";
   }
@@ -934,6 +938,9 @@ function debuggerRetryStep(ms: number, signal: AbortSignal) {
 // target — is a body this step cannot interpret, not a readiness state. Only
 // type is required: a target that already has a debugger attached is published
 // without webSocketDebuggerUrl, and picking the page target handles that.
+// A well-shaped array that holds no page target is not a fault either: it is
+// what Chrome answers before its first page registers, so the caller treats it
+// as not ready rather than as a body it can decide on.
 function parseDebuggerTargets(body: string) {
   let parsed: unknown;
   try {
@@ -959,8 +966,9 @@ function resolveDebuggerDeadlineMs(options: DebuggerTargetOptions) {
   return options.deadlineMs ?? DEBUGGER_TARGET_MS;
 }
 
-async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: DebuggerTargetOptions = {}) {
+async function fetchDebuggerPageTarget(url: string, signal: AbortSignal, options: DebuggerTargetOptions = {}) {
   const controller = new AbortController();
+  const startedAt = Date.now();
   let timedOut = false;
   let attempts = 0;
   const onAbort = () => controller.abort();
@@ -969,6 +977,11 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
     timedOut = true;
     controller.abort();
   }, resolveDebuggerDeadlineMs(options));
+  // A rejection from this step carries the interval it governed and the
+  // attempts it made, so a run that fails reports the same two numbers a run
+  // that succeeds prints. Both are counters, so the message and the process
+  // surface stay content-free.
+  const expiredAt = () => new ProofTimeoutError("debugger_target", undefined, Date.now() - startedAt, attempts);
   try {
     // Chrome can publish DevToolsActivePort before its devtools listener
     // accepts connections, so a refused or reset connection here is transient.
@@ -985,14 +998,22 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
         const response = await fetch(url, { signal: controller.signal });
         if (response.ok) {
           const targets = parseDebuggerTargets(await response.text());
-          if (targets) return targets;
-          unparseableBody = true;
+          if (targets) {
+            // A shaped list with no page target in it, the empty array
+            // included, is Chrome before its first page registers. That is a
+            // readiness state, so it retries inside the deadline like a
+            // refused connection instead of ending the step.
+            const page = targets.find((target) => target.type === "page");
+            if (page) return page;
+          } else {
+            unparseableBody = true;
+          }
         } else {
           await response.body?.cancel().catch(() => undefined);
         }
       } catch {
         if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
-        if (timedOut) throw new ProofTimeoutError("debugger_target");
+        if (timedOut) throw expiredAt();
       }
       // An OK response that is not a target list is a decided answer, so the
       // step ends on it instead of refetching a body that will not change. It
@@ -1000,10 +1021,10 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
       // only thing that retries. The payload detail keeps a broken endpoint
       // distinguishable from a slow one at the process surface, and stays
       // content-free: the stage and the word payload, nothing from the body.
-      if (unparseableBody) throw new ProofTimeoutError("debugger_target", "payload");
+      if (unparseableBody) throw new ProofTimeoutError("debugger_target", "payload", Date.now() - startedAt, attempts);
       await debuggerRetryStep(DEBUGGER_TARGET_RETRY_MS, controller.signal);
       if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
-      if (timedOut) throw new ProofTimeoutError("debugger_target");
+      if (timedOut) throw expiredAt();
     }
   } finally {
     clearTimeout(timer);
@@ -1016,29 +1037,298 @@ function activeTimerCount() {
   return process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
 }
 
-// The catch inside fetchDebuggerTargets must bind no error and must carry no
-// ProofTimeoutError guard. Comments are stripped before matching so prose that
-// names a forbidden shape cannot red the check, and the patterns tolerate any
-// spacing so reformatting cannot either. Stripping is naive on purpose: that
-// function holds no string literal containing a slash pair.
-function auditFetchSource(source: string) {
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
-  const catchBindings = code.match(/\}\s*catch\s*\(/g)?.length ?? 0;
-  const bindlessCatches = code.match(/\}\s*catch\s*\{/g)?.length ?? 0;
-  const timeoutGuards = code.match(/instanceof\s+ProofTimeoutError/g)?.length ?? 0;
+// What this audit proves, and what it cannot.
+//
+// The catch inside fetchDebuggerPageTarget must bind no error and must carry no
+// ProofTimeoutError guard: only fetch and the body read can throw there, neither
+// makes a ProofTimeoutError, so a guard in that position would be dead code
+// wearing the shape of a control. Earlier revisions asserted that shape against
+// the text, with a naive comment strip bounded by a second, hand-rolled
+// literal-aware strip. Both were approximations of a lexer, and the
+// approximation leaked in both directions: an unescaped slash pair inside a
+// regex literal opened a block comment for *both* strips at the same index, so
+// they agreed, the byte bound held, and a re-bound catch carrying a live guard
+// audited clean; while a string holding a line-comment or block-comment opener
+// reddened the audit with no sabotage present at all.
+//
+// So this reads the real parser instead of imitating it. ts.createSourceFile is
+// the front end tsc already runs over this file, so comments, strings, template
+// literals and regex literals are lexed as what they are and no arrangement of
+// them can move a count unless the code itself changed. The audit parses the
+// whole proof file, finds fetchDebuggerPageTarget by name in the tree rather
+// than by a text anchor, and counts syntax nodes inside it: catch clauses with
+// and without a binding, ProofTimeoutError guards in their instanceof and
+// name-string forms, and the one condition-less for loop the retry lives in. A
+// file that will not parse and a function that cannot be found are both red
+// audits; neither can produce a green one.
+//
+// What it cannot see: a guard anywhere in this function that binds its error
+// from a callback parameter instead of a catch clause (.catch(rethrowIfTimeout),
+// .catch(error => ...)), a guard that tests ProofTimeoutError identity without
+// naming it (a prototype comparison, an aliased import), a ProofTimeoutError
+// re-raised by a function declared elsewhere and invoked from here, and any
+// shape assembled at run time through eval or new Function. No behavioural check
+// backs the audit up for those: the guard it exists to refuse is dead by
+// construction, so it changes nothing a behavioural check could observe. This is
+// a shape check on one function body and claims nothing past it. The loop form
+// is load-bearing too: the retry must stay a for statement with no condition;
+// a while (true) or do/while rewrite reds the audit with no defect present.
+const FETCH_TARGET_NAME = "fetchDebuggerPageTarget";
+const TIMEOUT_ERROR_NAME = "ProofTimeoutError";
+
+function collectNodes<T extends ts.Node>(root: ts.Node, match: (node: ts.Node) => node is T) {
+  const found: T[] = [];
+  const visit = (node: ts.Node) => {
+    if (match(node)) found.push(node);
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(root, visit);
+  return found;
+}
+
+function isEndlessFor(node: ts.Node): node is ts.ForStatement {
+  return ts.isForStatement(node) && node.condition === undefined;
+}
+
+// instanceof ProofTimeoutError, name === "ProofTimeoutError", and the same name
+// reached through a switch all count as a guard: each one lets the catch decide
+// it is holding a timeout and rethrow it.
+function isTimeoutGuard(node: ts.Node): node is ts.BinaryExpression | ts.CaseClause {
+  const namesTheError = (expression: ts.Expression) =>
+    ts.isStringLiteralLike(expression) && expression.text === TIMEOUT_ERROR_NAME;
+  if (ts.isCaseClause(node)) return namesTheError(node.expression);
+  if (!ts.isBinaryExpression(node)) return false;
+  const operator = node.operatorToken.kind;
+  if (operator === ts.SyntaxKind.InstanceOfKeyword) {
+    return (ts.isIdentifier(node.right) && node.right.text === TIMEOUT_ERROR_NAME)
+      || (ts.isPropertyAccessExpression(node.right) && node.right.name.text === TIMEOUT_ERROR_NAME);
+  }
+  const isEquality = operator === ts.SyntaxKind.EqualsEqualsEqualsToken
+    || operator === ts.SyntaxKind.EqualsEqualsToken
+    || operator === ts.SyntaxKind.ExclamationEqualsEqualsToken
+    || operator === ts.SyntaxKind.ExclamationEqualsToken;
+  return isEquality && (namesTheError(node.left) || namesTheError(node.right));
+}
+
+// By name in the tree, both as a declaration and as a function assigned to that
+// name, so moving the function or renaming around it reds the audit instead of
+// silently auditing nothing.
+function findFetchFunction(sourceFile: ts.SourceFile): ts.Node[] {
+  const declared = collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(node) && node.name?.text === FETCH_TARGET_NAME);
+  const assigned = collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
+    ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === FETCH_TARGET_NAME
+      && node.initializer !== undefined
+      && (ts.isFunctionExpression(node.initializer) || ts.isArrowFunction(node.initializer)));
+  return [...declared, ...assigned.map((declaration) => declaration.initializer as ts.Node)];
+}
+
+function auditFetchSource(fileText: string) {
+  const red = {
+    method: "typescript-ast" as const,
+    parsed: false,
+    found: 0,
+    catchBindings: 0,
+    bindlessCatches: 0,
+    timeoutGuards: 0,
+    forEver: 0,
+    retryLoopBindless: false,
+    diagnostic: "",
+    clean: false,
+  };
+  const sourceFile = ts.createSourceFile(scriptPath, fileText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // parseDiagnostics is the parser's own error list. It is not on the public
+  // SourceFile type, so a TypeScript that stopped publishing it must red this
+  // audit rather than silently report a file with no errors.
+  const diagnostics = (sourceFile as unknown as { parseDiagnostics?: unknown }).parseDiagnostics;
+  if (!Array.isArray(diagnostics)) {
+    return { ...red, diagnostic: "parse diagnostics unavailable from this TypeScript build" };
+  }
+  if (diagnostics.length > 0) {
+    const first = diagnostics[0] as ts.DiagnosticWithLocation;
+    return { ...red, diagnostic: `TS${first.code} at ${first.start}: ${ts.flattenDiagnosticMessageText(first.messageText, " ")}` };
+  }
+  const matches = findFetchFunction(sourceFile);
+  if (matches.length !== 1) {
+    return { ...red, parsed: true, found: matches.length, diagnostic: `expected exactly one ${FETCH_TARGET_NAME}, found ${matches.length}` };
+  }
+  const catchClauses = collectNodes(matches[0], ts.isCatchClause);
+  const catchBindings = catchClauses.filter((clause) => clause.variableDeclaration !== undefined).length;
+  const bindlessCatches = catchClauses.length - catchBindings;
+  const timeoutGuards = collectNodes(matches[0], isTimeoutGuard).length;
+  const endless = collectNodes(matches[0], isEndlessFor);
+  const retryTries = endless.length === 1 ? collectNodes(endless[0].statement, ts.isTryStatement) : [];
+  const retryLoopBindless = retryTries.length === 1
+    && retryTries[0].catchClause !== undefined
+    && retryTries[0].catchClause.variableDeclaration === undefined;
   return {
-    sourceBytes: source.length,
-    codeBytes: code.length,
+    method: "typescript-ast" as const,
+    parsed: true,
+    found: 1,
     catchBindings,
     bindlessCatches,
     timeoutGuards,
-    clean: source.length > 0 && bindlessCatches >= 1 && catchBindings === 0 && timeoutGuards === 0,
+    forEver: endless.length,
+    retryLoopBindless,
+    diagnostic: "",
+    clean: catchBindings === 0
+      && bindlessCatches === 1
+      && timeoutGuards === 0
+      && endless.length === 1
+      && retryLoopBindless,
   };
 }
 
-// Drives the real fetchDebuggerTargets against a server that answers 200 with a
-// fixed body, and reports a content-free receipt of what came back.
-async function probeDebuggerBody(body: string) {
+type SourceEdit = { start: number; end: number; text: string };
+type FetchSourceAnchors = { beforeTry: number; catchHeadStart: number; catchHeadEnd: number; afterTry: number };
+
+// Probe sources are spliced at the parser's own node offsets. The probes this
+// replaces mutated whichever "} catch {" String.replace found first, so a
+// literal spelling that text earlier in the function would have retargeted them
+// silently; an offset taken from the catch clause itself cannot be retargeted.
+function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
+  const sourceFile = ts.createSourceFile(scriptPath, fileText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const matches = findFetchFunction(sourceFile);
+  if (matches.length !== 1) return undefined;
+  const endless = collectNodes(matches[0], isEndlessFor);
+  if (endless.length !== 1) return undefined;
+  const tries = collectNodes(endless[0].statement, ts.isTryStatement);
+  if (tries.length !== 1) return undefined;
+  const clause = tries[0].catchClause;
+  if (!clause || clause.variableDeclaration) return undefined;
+  return {
+    beforeTry: tries[0].getStart(sourceFile),
+    catchHeadStart: tries[0].tryBlock.getEnd() - 1,
+    catchHeadEnd: clause.block.getStart(sourceFile) + 1,
+    afterTry: tries[0].getEnd(),
+  };
+}
+
+// The audit itself, driven over mutated copies of this file: every formatting,
+// comment and literal shape that must stay green, every real regression that
+// must stay red, and the full cross-product of the literal shapes that defeated
+// the lexical strip against the two sabotages they were used to hide.
+function proveFetchSourceAudit(proofSource: string) {
+  const checkName = "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard";
+  const anchors = fetchSourceAnchors(proofSource);
+  if (!anchors) {
+    check(checkName, false, JSON.stringify({ method: "typescript-ast", error: "retry_catch_anchors_not_found" }));
+    return;
+  }
+  const applyEdits = (edits: SourceEdit[]) => [...edits]
+    .sort((left, right) => right.start - left.start)
+    .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), proofSource);
+  const before = (text: string): SourceEdit => ({ start: anchors.beforeTry, end: anchors.beforeTry, text });
+  const head = (text: string): SourceEdit => ({ start: anchors.catchHeadStart, end: anchors.catchHeadEnd, text });
+  const body = (text: string): SourceEdit => ({ start: anchors.catchHeadEnd, end: anchors.catchHeadEnd, text });
+  const after = (text: string): SourceEdit => ({ start: anchors.afterTry, end: anchors.afterTry, text });
+  const guardStatement = "\n        if (error instanceof ProofTimeoutError) throw error;";
+  const unescapedRegexOpener = "const slashy = /[/*]/;\n      if (slashy.test(url)) attempts += 0;\n      ";
+  const named = [
+    { name: "unmodified", source: proofSource, expected: true },
+    { name: "bindless_catch_without_spaces", source: applyEdits([head("}catch{")]), expected: true },
+    { name: "bindless_catch_with_extra_space", source: applyEdits([head("} catch  {")]), expected: true },
+    { name: "bindless_catch_across_a_newline", source: applyEdits([head("} catch\n    {")]), expected: true },
+    { name: "bindless_catch_with_tabs", source: applyEdits([head("}\tcatch\t{")]), expected: true },
+    { name: "binding_shape_named_in_a_line_comment", source: applyEdits([before("// A shape like } catch (error) { is forbidden here.\n      ")]), expected: true },
+    { name: "guard_named_in_a_block_comment", source: applyEdits([before("/* No instanceof ProofTimeoutError guard belongs here. */\n      ")]), expected: true },
+    { name: "both_shapes_named_in_one_block_comment", source: applyEdits([before("/* Neither } catch (error) { nor instanceof ProofTimeoutError belongs here. */\n      ")]), expected: true },
+    { name: "both_shapes_named_in_doubled_line_comments", source: applyEdits([before("// } catch (error) {\n      // instanceof ProofTimeoutError\n      ")]), expected: true },
+    { name: "binding_shape_commented_out_inside_the_function", source: applyEdits([head("// } catch (error) {\n      } catch {")]), expected: true },
+    { name: "catch_binds_an_error", source: applyEdits([head("} catch (error) {")]), expected: false },
+    { name: "catch_binds_without_spaces", source: applyEdits([head("}catch(error){")]), expected: false },
+    { name: "catch_binds_across_newlines", source: applyEdits([head("}\n catch\n (error)\n {")]), expected: false },
+    { name: "catch_removed_entirely", source: applyEdits([head("} finally {")]), expected: false },
+    { name: "second_binding_catch_appended", source: applyEdits([after("\n      try { attempts += 0 } catch (error) { void error }")]), expected: false },
+    { name: "timeout_guard_readded", source: applyEdits([body(guardStatement)]), expected: false },
+    { name: "timeout_guard_with_a_double_space", source: applyEdits([body("\n        if (error instanceof  ProofTimeoutError) throw error;")]), expected: false },
+    { name: "slash_pair_literal_after_the_binding", source: applyEdits([head("} catch (error) {"), body("\n        const trailer = \"/*\";")]), expected: false },
+    { name: "slash_pair_literals_around_a_rebound_catch", source: applyEdits([before("const opener = \"/*\";\n      "), head("} catch (error) {"), after("\n      const closer = \"*/ } catch {\";\n      if (closer.length) attempts += 0;")]), expected: false },
+    { name: "reviewer_unescaped_regex_opener_rebinding_and_line_comment_closer", source: applyEdits([before(unescapedRegexOpener), head("} catch (error) {"), body(guardStatement), after("\n      // The shape */ } catch { must never appear below.")]), expected: false },
+    { name: "unescaped_regex_atom_opener_with_a_rebound_catch", source: applyEdits([before("const slashy = /a\\/*/;\n      if (slashy.test(url)) attempts += 0;\n      "), head("} catch (error) {")]), expected: false },
+    { name: "unescaped_regex_opener_with_a_timeout_guard_only", source: applyEdits([before(unescapedRegexOpener), body(guardStatement)]), expected: false },
+    { name: "name_string_guard_in_the_bindless_catch", source: applyEdits([body("\n        if ((error as Error).name === \"ProofTimeoutError\") throw error;")]), expected: false },
+    { name: "name_string_guard_through_a_switch", source: applyEdits([body("\n        switch ((error as Error).name) { case \"ProofTimeoutError\": throw error; }")]), expected: false },
+    { name: "unparseable_source_fails_closed", source: applyEdits([head("{")]), expected: false },
+    { name: "unescaped_regex_literal_alone", source: applyEdits([before(unescapedRegexOpener)]), expected: true },
+    { name: "escaped_regex_literal_slash_pair", source: applyEdits([before("const slashy = /\\/\\*/;\n      if (slashy.test(url)) attempts += 0;\n      ")]), expected: true },
+    { name: "string_with_an_escaped_quote_and_a_slash_pair", source: applyEdits([before("const quoted = \"a\\\"b/*\";\n      if (quoted.length) attempts += 0;\n      ")]), expected: true },
+    { name: "string_with_a_double_slash_url", source: applyEdits([before("const listed = \"http://example.invalid/json\";\n      if (listed.length) attempts += 0;\n      ")]), expected: true },
+    { name: "template_literal_with_a_quote_in_an_interpolation", source: applyEdits([before("const shaped = `x${\"a'b\\\"c\"}y`;\n      if (shaped.length) attempts += 0;\n      ")]), expected: true },
+    { name: "line_comment_containing_a_block_comment_close", source: applyEdits([before("// this line closes nothing */ at all\n      ")]), expected: true },
+    { name: "nested_looking_block_comment", source: applyEdits([before("/* /* */\n      ")]), expected: true },
+    { name: "guard_named_in_a_string_literal", source: applyEdits([before("const prose = \"instanceof ProofTimeoutError\";\n      if (prose.length) attempts += 0;\n      ")]), expected: true },
+    { name: "odd_spacing_and_tabs_around_the_catch", source: applyEdits([head("}  \t catch \t {")]), expected: true },
+  ];
+  // Every literal opener that defeated the lexical strip, crossed with every
+  // closer it was paired with and with the two sabotages they were used to
+  // hide. The parser makes all of them irrelevant to the counts, and this
+  // cross-product is what keeps that true.
+  const openers = [
+    { key: "no_opener", text: "" },
+    { key: "unescaped_regex_class", text: unescapedRegexOpener },
+    { key: "unescaped_regex_atom", text: "const slashy = /a\\/*/;\n      if (slashy.test(url)) attempts += 0;\n      " },
+    { key: "escaped_regex_pair", text: "const slashy = /\\/\\*/;\n      if (slashy.test(url)) attempts += 0;\n      " },
+    { key: "string_slash_pair", text: "const opener = \"/*\";\n      if (opener.length) attempts += 0;\n      " },
+  ];
+  const closers = [
+    { key: "no_closer", text: "" },
+    { key: "line_comment_closer", text: "\n      // The shape */ } catch { must never appear below." },
+    { key: "string_closer", text: "\n      const closer = \"*/ } catch {\";\n      if (closer.length) attempts += 0;" },
+    { key: "block_comment_closer", text: "\n      /* this closes the pair */" },
+  ];
+  const sabotages = [
+    { key: "no_sabotage", expected: true, edits: [] as SourceEdit[] },
+    { key: "rebound_catch", expected: false, edits: [head("} catch (error) {")] },
+    { key: "timeout_guard", expected: false, edits: [body(guardStatement)] },
+  ];
+  const matrix = openers.flatMap((opener) => closers.flatMap((closer) => sabotages.map((sabotage) => ({
+    name: `matrix__${opener.key}__${closer.key}__${sabotage.key}`,
+    source: applyEdits([
+      ...(opener.text ? [before(opener.text)] : []),
+      ...(closer.text ? [after(closer.text)] : []),
+      ...sabotage.edits,
+    ]),
+    expected: sabotage.expected,
+  }))));
+  const results = [...named, ...matrix].map((probe) => {
+    const audit = auditFetchSource(probe.source);
+    return {
+      name: probe.name,
+      expected: probe.expected,
+      clean: audit.clean,
+      parsed: audit.parsed,
+      catchBindings: audit.catchBindings,
+      bindlessCatches: audit.bindlessCatches,
+      timeoutGuards: audit.timeoutGuards,
+      forEver: audit.forEver,
+      ...(audit.diagnostic ? { diagnostic: audit.diagnostic } : {}),
+    };
+  });
+  const mismatches = results.filter((result) => result.clean !== result.expected);
+  const malicious = results.filter((result) => !result.expected);
+  const benign = results.filter((result) => result.expected);
+  check(
+    checkName,
+    named.length === 34 && matrix.length === 60 && results.length === 94 && mismatches.length === 0,
+    JSON.stringify({
+      method: "typescript-ast",
+      probes: results.length,
+      maliciousRed: `${malicious.filter((result) => !result.clean).length}/${malicious.length}`,
+      benignGreen: `${benign.filter((result) => result.clean).length}/${benign.length}`,
+      mismatches,
+      matrix: { variants: matrix.length, openers: openers.length, closers: closers.length, sabotages: sabotages.length },
+      named: results.slice(0, named.length),
+    }),
+  );
+}
+
+// Drives the real fetchDebuggerPageTarget against a server that answers 200
+// with a fixed body, and reports a content-free receipt of what came back. The
+// options ride through so a probe can hold a body against an injected deadline.
+async function probeDebuggerBody(body: string, options: DebuggerTargetOptions = {}) {
   let requests = 0;
   const server = http.createServer((_request, response) => {
     requests += 1;
@@ -1053,7 +1343,8 @@ async function probeDebuggerBody(body: string) {
   let attempts = 0;
   let error: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${port}/json/list`, signal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${port}/json/list`, signal, {
+      ...options,
       onAttempts: (count) => { attempts = count },
     });
   } catch (caught) {
@@ -1136,39 +1427,14 @@ async function proveDebuggerTargetRetry() {
   );
 
   const proofSource = fs.readFileSync(scriptPath, "utf8");
-  const fetchSource = proofSource.slice(
-    proofSource.indexOf("async function fetchDebuggerTargets"),
-    proofSource.indexOf("function activeTimerCount"),
-  );
-  const fetchAudit = auditFetchSource(fetchSource);
+  const fetchAudit = auditFetchSource(proofSource);
   check(
     "debugger_target_fetch_catch_binds_no_error_so_a_timeout_guard_cannot_live_there",
     fetchAudit.clean,
     JSON.stringify(fetchAudit),
   );
 
-  // The audit itself, driven over mutated copies of that source: the four
-  // formatting and comment shapes that must stay green, and the two real
-  // regressions that must stay red.
-  const bindlessCatch = "} catch {";
-  const auditProbes = [
-    { name: "unmodified", source: fetchSource, expected: true },
-    { name: "bindless_catch_without_spaces", source: fetchSource.replace(bindlessCatch, "}catch{"), expected: true },
-    { name: "bindless_catch_with_extra_space", source: fetchSource.replace(bindlessCatch, "} catch  {"), expected: true },
-    { name: "binding_shape_named_in_a_line_comment", source: `${fetchSource}\n// A shape like } catch (error) { is forbidden here.\n`, expected: true },
-    { name: "guard_named_in_a_block_comment", source: `${fetchSource}\n/* No instanceof ProofTimeoutError guard belongs here. */\n`, expected: true },
-    { name: "catch_binds_an_error", source: fetchSource.replace(bindlessCatch, "} catch (error) {"), expected: false },
-    { name: "timeout_guard_readded", source: fetchSource.replace(bindlessCatch, "} catch {\n        if (error instanceof ProofTimeoutError) throw error;"), expected: false },
-  ];
-  const auditResults = auditProbes.map((probe) => {
-    const audit = auditFetchSource(probe.source);
-    return { name: probe.name, clean: audit.clean, expected: probe.expected, catchBindings: audit.catchBindings, bindlessCatches: audit.bindlessCatches, timeoutGuards: audit.timeoutGuards };
-  });
-  check(
-    "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard",
-    auditResults.length === 7 && auditResults.every((result) => result.clean === result.expected),
-    JSON.stringify(auditResults),
-  );
+  proveFetchSourceAudit(proofSource);
 
   const pageTarget = { type: "page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/proof" };
   let connections = 0,requests = 0;
@@ -1196,10 +1462,10 @@ async function proveDebuggerTargetRetry() {
   const retrySignal = new AbortController().signal;
   const retryTimersBefore = activeTimerCount();
   const retryStartedAt = Date.now();
-  let retryTargets: Array<{ type: string; webSocketDebuggerUrl: string }> | undefined;
+  let retryTarget: { type: string; webSocketDebuggerUrl: string } | undefined;
   let retryError: unknown;
   try {
-    retryTargets = await fetchDebuggerTargets(`http://127.0.0.1:${flakyPort}/json/list`, retrySignal);
+    retryTarget = await fetchDebuggerPageTarget(`http://127.0.0.1:${flakyPort}/json/list`, retrySignal);
   } catch (error) {
     retryError = error;
   }
@@ -1210,7 +1476,7 @@ async function proveDebuggerTargetRetry() {
   check(
     "debugger_targets_retry_resolves_after_refused_connections_and_non_ok_responses",
     retryError === undefined &&
-      retryTargets?.find((target) => target.type === "page")?.webSocketDebuggerUrl === pageTarget.webSocketDebuggerUrl &&
+      retryTarget?.webSocketDebuggerUrl === pageTarget.webSocketDebuggerUrl &&
       connections > 2 &&
       requests > 1 &&
       retryElapsedMs < DEBUGGER_TARGET_MS &&
@@ -1219,7 +1485,7 @@ async function proveDebuggerTargetRetry() {
       flakyClosed,
     JSON.stringify({
       error: retryError instanceof Error ? retryError.message : "none",
-      targets: retryTargets?.length ?? 0,
+      target: retryTarget?.type ?? "none",
       connections,
       requests,
       elapsedMs: retryElapsedMs,
@@ -1227,6 +1493,63 @@ async function proveDebuggerTargetRetry() {
       timersAfter: retryTimers,
       listeners: retryListeners,
       serverClosed: flakyClosed,
+    }),
+  );
+
+  // Chrome answers /json/list before its first page target registers. That
+  // answer is well shaped and holds no page target, so the step must poll
+  // through it and resolve when the page appears, inside the deadline.
+  const registeredTarget = { type: "page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/registered" };
+  const emptyAnswers = 3;
+  let registeringRequests = 0;
+  const registering = http.createServer((_request, response) => {
+    registeringRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(
+      registeringRequests <= emptyAnswers ? [] : [{ type: "background_page" }, registeredTarget],
+    ));
+  });
+  await new Promise<void>((resolve) => registering.listen(0, "127.0.0.1", () => resolve()));
+  const registeringPort = (registering.address() as AddressInfo).port;
+  const registeringSignal = new AbortController().signal;
+  const registeringTimersBefore = activeTimerCount();
+  const registeringStartedAt = Date.now();
+  let registeringAttempts = 0;
+  let registeringTarget: { type: string; webSocketDebuggerUrl: string } | undefined;
+  let registeringError: unknown;
+  try {
+    registeringTarget = await fetchDebuggerPageTarget(`http://127.0.0.1:${registeringPort}/json/list`, registeringSignal, {
+      onAttempts: (attempts) => { registeringAttempts = attempts },
+    });
+  } catch (error) {
+    registeringError = error;
+  }
+  const registeringElapsedMs = Date.now() - registeringStartedAt;
+  const registeringTimers = activeTimerCount();
+  const registeringListeners = getEventListeners(registeringSignal, "abort").length;
+  const registeringClosed = await closeFixtureServer(registering);
+  check(
+    "debugger_target_empty_list_is_transient_and_retried_until_the_page_target_registers",
+    registeringError === undefined &&
+      registeringTarget?.webSocketDebuggerUrl === registeredTarget.webSocketDebuggerUrl &&
+      registeringAttempts === emptyAnswers + 1 &&
+      registeringRequests === emptyAnswers + 1 &&
+      registeringElapsedMs < DEBUGGER_TARGET_MS &&
+      registeringTimers <= registeringTimersBefore &&
+      registeringListeners === 0 &&
+      registeringClosed,
+    JSON.stringify({
+      error: registeringError instanceof Error ? registeringError.message : "none",
+      target: registeringTarget?.type ?? "none",
+      emptyAnswers,
+      requests: registeringRequests,
+      attempts: registeringAttempts,
+      elapsedMs: registeringElapsedMs,
+      deadlineMs: DEBUGGER_TARGET_MS,
+      timersBefore: registeringTimersBefore,
+      timersAfter: registeringTimers,
+      listeners: registeringListeners,
+      serverClosed: registeringClosed,
     }),
   );
 
@@ -1303,7 +1626,7 @@ async function proveDebuggerTargetRetry() {
   let deadlineAttempts = 0;
   let deadlineError: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${refusing.port}/json/list`, deadlineSignal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${refusing.port}/json/list`, deadlineSignal, {
       deadlineMs: NEVER_READY_DEADLINE_MS,
       onAttempts: (attempts) => { deadlineAttempts = attempts },
     });
@@ -1350,7 +1673,7 @@ async function proveDebuggerTargetRetry() {
   let refusedAttempts = 0;
   let refusedError: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${refusedPort}/json/list`, refusedSignal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${refusedPort}/json/list`, refusedSignal, {
       deadlineMs: NEVER_READY_DEADLINE_MS,
       onAttempts: (attempts) => { refusedAttempts = attempts },
     });
@@ -1382,11 +1705,45 @@ async function proveDebuggerTargetRetry() {
       attempts: refusedAttempts,
       elapsedMs: refusedElapsedMs,
       deadlineMs: NEVER_READY_DEADLINE_MS,
+      shippedDeadlineMs: DEBUGGER_TARGET_MS,
       listenerClosed: vacatedClosed,
       portStillFree: refusedPortStillFree,
       timersBefore: refusedTimersBefore,
       timersAfter: refusedTimers,
       listeners: refusedListeners,
+    }),
+  );
+
+  // The other end of the same readiness state: a page target that never
+  // registers must reach the deadline as the content-free debugger_target
+  // timeout, not as a decided payload fault and not as a raw error. Injected
+  // deadline, for the reason above.
+  const neverRegisters = await probeDebuggerBody("[]", { deadlineMs: NEVER_READY_DEADLINE_MS });
+  check(
+    "debugger_target_list_without_a_page_target_rejects_at_deadline_content_free_without_leaks",
+    neverRegisters.isTimeoutError &&
+      neverRegisters.message === "proof_timeout:debugger_target" &&
+      !neverRegisters.message.includes(String(neverRegisters.port)) &&
+      !neverRegisters.message.includes("127.0.0.1") &&
+      !neverRegisters.message.includes("json") &&
+      neverRegisters.attempts > 1 &&
+      neverRegisters.requests > 1 &&
+      neverRegisters.elapsedMs >= NEVER_READY_DEADLINE_MS &&
+      neverRegisters.elapsedMs < NEVER_READY_DEADLINE_MS + ABORT_SETTLE_MS &&
+      neverRegisters.timersAfter <= neverRegisters.timersBefore &&
+      neverRegisters.listeners === 0 &&
+      neverRegisters.serverClosed,
+    JSON.stringify({
+      error: neverRegisters.message,
+      requests: neverRegisters.requests,
+      attempts: neverRegisters.attempts,
+      elapsedMs: neverRegisters.elapsedMs,
+      deadlineMs: NEVER_READY_DEADLINE_MS,
+      shippedDeadlineMs: DEBUGGER_TARGET_MS,
+      timersBefore: neverRegisters.timersBefore,
+      timersAfter: neverRegisters.timersAfter,
+      listeners: neverRegisters.listeners,
+      serverClosed: neverRegisters.serverClosed,
     }),
   );
 
@@ -1537,32 +1894,41 @@ async function browserProof(html: string) {
     const activePort = path.join(profile, "DevToolsActivePort");
     await waitForFile(activePort, chrome, controller.signal);
     const [debugPort] = fs.readFileSync(activePort, "utf8").split("\n");
-    // The interval DEBUGGER_TARGET_MS actually governs. Printed on every run,
-    // numbers only, so hosted runs accumulate the distribution that record is
-    // still missing.
+    // The interval DEBUGGER_TARGET_MS actually governs, emitted from a finally
+    // so the run that expires the deadline prints it too. Numbers only, so
+    // hosted runs accumulate the distribution that record is still missing
+    // from their failures as well as from their successes; the rejection
+    // carries the same two numbers to the process surface.
     const readinessStartedAt = Date.now();
     let debuggerAttempts = 0;
-    const targets = await fetchDebuggerTargets(
-      `http://127.0.0.1:${debugPort}/json/list`,
-      controller.signal,
-      { onAttempts: (attempts) => { debuggerAttempts = attempts } },
-    );
-    const debuggerReadyMs = Date.now() - readinessStartedAt;
-    check(
-      "browser_debugger_target_readiness_receipt_present_and_numeric",
-      Number.isFinite(debuggerReadyMs) &&
-        debuggerReadyMs >= 0 &&
-        debuggerReadyMs < DEBUGGER_TARGET_MS &&
-        Number.isInteger(debuggerAttempts) &&
-        debuggerAttempts >= 1,
-      JSON.stringify({
-        devtoolsActivePortToTargetsMs: debuggerReadyMs,
-        attempts: debuggerAttempts,
-        deadlineMs: DEBUGGER_TARGET_MS,
-      }),
-    );
-    const page = targets.find((target) => target.type === "page");
-    if (!page) throw new Error("Chrome page target unavailable");
+    let debuggerResolved = false;
+    const page = await (async () => {
+      try {
+        const target = await fetchDebuggerPageTarget(
+          `http://127.0.0.1:${debugPort}/json/list`,
+          controller.signal,
+          { onAttempts: (attempts) => { debuggerAttempts = attempts } },
+        );
+        debuggerResolved = true;
+        return target;
+      } finally {
+        const debuggerReadyMs = Date.now() - readinessStartedAt;
+        check(
+          "browser_debugger_target_readiness_receipt_present_and_numeric",
+          Number.isFinite(debuggerReadyMs) &&
+            debuggerReadyMs >= 0 &&
+            Number.isInteger(debuggerAttempts) &&
+            debuggerAttempts >= 1 &&
+            (!debuggerResolved || debuggerReadyMs < DEBUGGER_TARGET_MS),
+          JSON.stringify({
+            devtoolsActivePortToTargetsMs: debuggerReadyMs,
+            attempts: debuggerAttempts,
+            resolved: debuggerResolved,
+            deadlineMs: DEBUGGER_TARGET_MS,
+          }),
+        );
+      }
+    })();
     cdp = await CdpClient.connect(page.webSocketDebuggerUrl, { signal: controller.signal });
     const pageErrors: string[] = [],consoleErrors: string[] = [],requests: string[] = [];
     cdp.on("Runtime.exceptionThrown", (params) => pageErrors.push(JSON.stringify(params)));
@@ -1730,6 +2096,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) main().catc
       stage: error.stage,
       ...(stageDetail ? { detail: stageDetail } : {}),
       ...(error.elapsedMs !== undefined ? { elapsedMs: error.elapsedMs } : {}),
+      ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
     }));
   } else {
     console.error(error instanceof Error ? error.stack : String(error));
