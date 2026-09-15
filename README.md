@@ -288,6 +288,39 @@ No additional raw-ledger query is made. The standalone ledger-side health query
 retains its existing meaning. Even a `projected` count is not proof that every
 event has a session link; this change does not repair the projection backlog.
 
+### Rolling the collector back: the projection schema version
+
+The derived dashboard projection carries a `schema_version`, and that version
+moves whenever the derived tables change shape. It exists for the **downgrade**
+direction: a collector that opens a projection written by a newer binary cannot
+know what the extra shape means, so it **fails closed** rather than half-read
+it. The projection is marked not ready with `degradedReason:
+"projection_schema_newer"`, maintenance does no derived work, and the status
+snapshot serves no session count at all. It never serves the last count it had.
+The stored version is left exactly as the newer binary published it, so
+re-installing that binary and restarting the collector is the whole recovery.
+
+That guard can only protect a rollback to a binary that carries it. A collector
+older than the guard reads no version, and one older than **#360**
+(eco-6hoxj.80 r3) also predates `last_token_event_at` on
+`dashboard_session_source_window` and `dashboard_session_repair_source`. Its
+positional session insert-select fails to compile against the wider tables —
+`table dashboard_session_source_window has 13 columns but 12 values were
+supplied` — on every maintenance tick, which is what made such a rollback go on
+serving a frozen, green session count. Rolling back that far is a manual
+operation. With the collector **stopped**, against the ledger
+(`~/.plimsoll/work-ledger.sqlite` unless `PLIMSOLL_HOME` moves it):
+
+```sql
+alter table dashboard_session_repair_source drop column last_token_event_at;
+alter table dashboard_session_source_window drop column last_token_event_at;
+```
+
+The columns are additive and the old binary re-derives everything it needs, so
+dropping them restores session materialization exactly. Re-upgrading adds them
+back on open and refills them from the facts the ledger still holds. Rebuilding
+the projection from the raw ledger is the equivalent heavier alternative.
+
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
 On a host with many capture roots one sweep therefore spans many cadences, and
@@ -610,7 +643,7 @@ Every failed receipt carries a `recovery`, which is one of:
 
 | `recovery` | What it means |
 |---|---|
-| `config_applied_collector_restarted` | The write completed. The config names the new roots, the fence belongs to them, and the collector came back verified. |
+| `config_applied_collector_restarted` | The write completed. The config names the new roots, the fence belongs to them, and the restart, where one was attempted, came back verified. On a host with no LaunchAgent installed there is no service to cycle, so no restart is attempted and the same value is emitted with `restart.skipped: true` and `reason: "launch_agent_not_installed"`: the write and the fence are what this value speaks to, and `restart.skipped` / `restart.verified` is the authority on the daemon. |
 | `config_applied_collector_not_running` | The write completed and the fence belongs to the new roots, but the collector this command stopped did not come back. `restart.failedStep` names where it stopped: start the daemon again. |
 | `config_unchanged_fence_rolled_back` | The config is byte-identical to the backup, and every generation row this run fenced was removed again. |
 | `ledger_fence_retained` | The config was **not** written and a fence for those roots is still in the ledger: either this run could not roll its own rows back, or an earlier run's rows are still in place and are not this run's to remove (`fenceRollback.generationsRetainedFromEarlierRun`). `fenceRollback.retainedFiles` lists the files fenced under the new roots (a superset of what is still excluded) — remove their rows or re-run the add to register the root they belong to. |
@@ -618,7 +651,8 @@ Every failed receipt carries a `recovery`, which is one of:
 | `config_unchanged_restored_state_matches_backup` | The config is byte-identical to the backup and no fence for these roots is in the ledger. |
 
 The three `config_unchanged_*` values speak to the config and the ledger only;
-`restart.verified` is the authority on whether the daemon came back.
+`restart.skipped` / `restart.verified` is the authority on whether the daemon
+came back — and on whether one was ever asked to.
 
 `backupPath` is only ever a backup that exists on disk; `backupWritten` says
 whether the backup step completed. A retry whose fence is already in place
