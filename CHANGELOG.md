@@ -35,6 +35,12 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Local producer admission restores two Studio0 rejection classes
+  (`eco-6hoxj.25`): identity-encoded bodies between 2 MiB and 4 MiB are no
+  longer `compressed_body_too_large`, Claude HTTP hooks always send
+  `x-plimsoll-source` (and the producer token when provisioned), and first-line
+  token/body rejections name the closed route so hook vs OTLP is visible
+  without a collector restart.
 - A managed-config reconcile that loses the state-file lock still writes its
   apply/refuse receipt; the stamp, backoff map and backup record retry on the
   next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner

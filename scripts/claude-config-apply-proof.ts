@@ -145,6 +145,7 @@ function main() {
       },
     };
     writeJson(existing, preimage, 0o644);
+    fs.chmodSync(existing, 0o644);
     const preimageSource = fs.readFileSync(existing, "utf8");
     const preview = applyClaudeSettings(existing, generated, { dryRun: true });
     check(
@@ -188,6 +189,34 @@ function main() {
         logsEndpoint: reconciled.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
         metricsEndpoint: reconciled.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
       },
+    );
+    const ownedHook = reconciled.hooks.UserPromptSubmit[1].hooks[0] as {
+      type?: string;
+      headers?: Record<string, string>;
+    };
+    check(
+      "tokenless_owned_http_hooks_still_send_source_header",
+      ownedHook.type === "http" &&
+        ownedHook.headers?.["x-plimsoll-source"] === "claude_code" &&
+        ownedHook.headers?.["x-plimsoll-token"] === undefined &&
+        generated.hooks.UserPromptSubmit[0].hooks[0].headers["x-plimsoll-source"] === "claude_code",
+      { hookHeaders: ownedHook.headers },
+    );
+    const tokened = generateClaudeCodeSettings({
+      repoRoot: "/synthetic/plimsoll/source",
+      port: 49130,
+      dataMode: "metadata",
+      claudeCodeProducerToken: "C".repeat(43),
+    });
+    const tokenedHook = tokened.hooks.UserPromptSubmit[0].hooks[0] as {
+      headers?: Record<string, string>;
+    };
+    check(
+      "tokened_claude_http_hooks_send_source_and_producer_token",
+      tokenedHook.headers?.["x-plimsoll-source"] === "claude_code" &&
+        tokenedHook.headers?.["x-plimsoll-token"] === "C".repeat(43) &&
+        tokened.env.OTEL_EXPORTER_OTLP_HEADERS.includes("x-plimsoll-token="),
+      { headerNames: Object.keys(tokenedHook.headers ?? {}).sort() },
     );
     const backupPath = result.backupPath!;
     check(

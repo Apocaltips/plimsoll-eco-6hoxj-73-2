@@ -76,9 +76,16 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
   const otlpHeaders = options.claudeCodeProducerToken
     ? `x-plimsoll-source=claude_code,x-plimsoll-token=${options.claudeCodeProducerToken}`
     : "x-plimsoll-source=claude_code";
-  const hookHeaders = options.claudeCodeProducerToken
-    ? { "x-plimsoll-token": options.claudeCodeProducerToken }
-    : undefined;
+  // HTTP hooks identify the producer on the path, but classifyRejectionClient
+  // only reads x-plimsoll-source. Untokened Claude hook posts were therefore
+  // logged as clientClass=unknown (or, with OTEL, as claude_code without a
+  // token). Always send the source header; attach the token when provisioned.
+  const hookHeaders: Record<string, string> = {
+    "x-plimsoll-source": "claude_code",
+    ...(options.claudeCodeProducerToken
+      ? { "x-plimsoll-token": options.claudeCodeProducerToken }
+      : {}),
+  };
 
   return {
     env: {
@@ -102,7 +109,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
+              headers: hookHeaders,
               timeout: 5,
             },
           ],
@@ -115,7 +122,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
+              headers: hookHeaders,
               timeout: 5,
             },
           ],
@@ -127,7 +134,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
+              headers: hookHeaders,
               timeout: 5,
             },
           ],
