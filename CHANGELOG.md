@@ -28,6 +28,10 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Daemon session sync now converges without `upload-history --sessions`. A
+  failed or interrupted 5-minute refresh survives restart, and a ledger
+  catch-up covers sessions whose events were already uploaded so they never
+  re-entered the touched window.
 - Automatic maintenance now keeps committed progress across deadlines, bounds
   cursor and enrichment work, and reaps disposable workers before replacement.
 - Maintenance worker startup is separated from ledger initialization and has a
