@@ -402,8 +402,9 @@ Config tools:
       Push one snapshot per stitched ledger session (issue 0037) so the workspace
       holds REAL session rows that join to their events. The cloud upserts
       grow-only by deterministic session id — re-running over the same --until
-      changes nothing. The daemon refreshes touched sessions after each 5-minute
-      sync; this command is the full backfill and the post-restart recovery tool.
+      changes nothing. The daemon catch-up-walks until one full push is accepted,
+      then refreshes pending, just-uploaded, and later ledger sessions. This
+      command remains the operator full walk.
   upload-replay --reason <receipt reason> [--since ISO-8601] [--limit N] [--dry-run]
       Supersede dead upload receipts whose reason is remote (remote_validation_rejected,
       remote_rejected_exhausted) and hand their raw rows back to the normal enqueue path.
@@ -2491,7 +2492,11 @@ async function main() {
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
       const persistSessionCarry = () => {
         sessionSyncState = { ...sessionSyncState, pendingSessionIds };
-        saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+        try {
+          saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+        } catch {
+          sessionSyncState = { ...sessionSyncState, caughtUp: false };
+        }
       };
       const carrySessions = () => {
         pendingSessionIds = [
@@ -2534,25 +2539,24 @@ async function main() {
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
         // walk is accepted. Isolated failure domain: events are already
-        // marked uploaded, so a session-push error must never look like a
-        // sync failure or trigger the event backoff.
-        const sessionPlan = planDaemonSessionSync({
-          db: buffer.database,
-          state: { ...sessionSyncState, pendingSessionIds },
-          uploadedBatches,
-          until: new Date().toISOString(),
-        });
-        sessionSyncState = sessionPlan.state;
-        pendingSessionIds = sessionPlan.state.pendingSessionIds;
-        saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+        // marked uploaded, so a session-push or planner error must never
+        // look like a sync failure or trigger the event backoff.
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        void touchedSessionIds;
-        if (!sessionPlan.skip) {
-          try {
+        try {
+          const sessionPlan = planDaemonSessionSync({
+            db: buffer.database,
+            state: { ...sessionSyncState, pendingSessionIds },
+            uploadedBatches,
+            until: new Date().toISOString(),
+          });
+          sessionSyncState = sessionPlan.state;
+          pendingSessionIds = sessionPlan.state.pendingSessionIds;
+          persistSessionCarry();
+          if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
-              ...(sessionPlan.sessionIds ? { sessionIds: sessionPlan.sessionIds } : {}),
+              ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
               until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
@@ -2564,7 +2568,7 @@ async function main() {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
-            saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+            persistSessionCarry();
             if (sessionResult.ok && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2585,18 +2589,18 @@ async function main() {
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
               );
             }
-          } catch (error) {
-            pendingSessionIds = touchedSessionIds;
-            console.warn(
-              JSON.stringify({
-                warning: "session_sync_failed",
-                message: error instanceof Error ? error.message : String(error),
-              }),
-            );
-            sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
-            pendingSessionIds = sessionSyncState.pendingSessionIds;
-            saveDaemonSessionSyncState(buffer.database, sessionSyncState);
           }
+        } catch (error) {
+          pendingSessionIds = touchedSessionIds;
+          console.warn(
+            JSON.stringify({
+              warning: "session_sync_failed",
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          );
+          sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
+          pendingSessionIds = sessionSyncState.pendingSessionIds;
+          persistSessionCarry();
         }
       } catch (error) {
         carrySessions();
