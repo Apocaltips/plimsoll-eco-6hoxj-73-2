@@ -230,7 +230,15 @@ import { OutcomeTimelineStore } from "./outcome-timeline-store";
 import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
-import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
+import {
+  commitDaemonSessionSyncFailure,
+  commitDaemonSessionSyncSuccess,
+  loadDaemonSessionSyncState,
+  planDaemonSessionSync,
+  runSessionSync,
+  saveDaemonSessionSyncState,
+  sessionIdsFromBatches,
+} from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
@@ -2468,11 +2476,12 @@ async function main() {
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
     let syncInFlight = false;
 
-    // Sessions whose snapshot push failed (or was interrupted) carry over to
-    // the next cycle in memory. A daemon restart drops the set — the
-    // `upload-history --sessions` backfill is the stateless recovery tool,
-    // exactly as the event side's recovery is upload-history itself.
-    let pendingSessionIds: string[] = [];
+    // Sessions whose snapshot push failed (or was interrupted) carry over
+    // across cycles and restarts in maintenance_state. Until one full walk
+    // is accepted, each cycle catch-up-walks the ledger so a missed first
+    // refresh does not wait for `upload-history --sessions`.
+    let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
+    let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
@@ -2480,10 +2489,15 @@ async function main() {
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
+      const persistSessionCarry = () => {
+        sessionSyncState = { ...sessionSyncState, pendingSessionIds };
+        saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+      };
       const carrySessions = () => {
         pendingSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
+        persistSessionCarry();
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
@@ -2517,23 +2531,40 @@ async function main() {
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
 
-        // Session sync (issue 0037): the sessions whose events just crossed
-        // get their snapshots refreshed — recomputed over the FULL ledger,
-        // pushed as a kind:"session_sync" batch the cloud upserts grow-only.
-        // Isolated failure domain: events are already marked uploaded, so a
-        // session-push error must never look like a sync failure or trigger
-        // the event backoff; the ids simply carry to the next cycle.
+        // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
+        // plus durable pending, and a ledger catch-up until the first full
+        // walk is accepted. Isolated failure domain: events are already
+        // marked uploaded, so a session-push error must never look like a
+        // sync failure or trigger the event backoff.
+        const sessionPlan = planDaemonSessionSync({
+          db: buffer.database,
+          state: { ...sessionSyncState, pendingSessionIds },
+          uploadedBatches,
+          until: new Date().toISOString(),
+        });
+        sessionSyncState = sessionPlan.state;
+        pendingSessionIds = sessionPlan.state.pendingSessionIds;
+        saveDaemonSessionSyncState(buffer.database, sessionSyncState);
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        if (touchedSessionIds.length > 0) {
+        void touchedSessionIds;
+        if (!sessionPlan.skip) {
           try {
             const sessionResult = await runSessionSync(config, {
-              sessionIds: touchedSessionIds,
+              ...(sessionPlan.sessionIds ? { sessionIds: sessionPlan.sessionIds } : {}),
+              until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
             });
-            pendingSessionIds = sessionResult.ok ? [] : touchedSessionIds;
+            if (sessionResult.ok) {
+              sessionSyncState = commitDaemonSessionSyncSuccess(sessionSyncState, sessionPlan.until);
+              pendingSessionIds = [];
+            } else {
+              sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
+            }
+            saveDaemonSessionSyncState(buffer.database, sessionSyncState);
             if (sessionResult.ok && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2562,6 +2593,9 @@ async function main() {
                 message: error instanceof Error ? error.message : String(error),
               }),
             );
+            sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
+            pendingSessionIds = sessionSyncState.pendingSessionIds;
+            saveDaemonSessionSyncState(buffer.database, sessionSyncState);
           }
         }
       } catch (error) {
