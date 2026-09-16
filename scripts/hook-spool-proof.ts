@@ -421,13 +421,16 @@ async function startResettingListener() {
   };
 }
 
-function httpResponseComplete(buf: Buffer) {
+/**
+ * The collector writes 202 only after `admitHookBody` returns, so the status
+ * line is enough: the row is committed. Do not wait for Content-Length — Node
+ * may send the 202 as chunked keep-alive with no length, and waiting for the
+ * keep-alive FIN would retarget this case onto the timeout spool path.
+ */
+function httpResponseCommitted(buf: Buffer) {
   const headerEnd = buf.indexOf("\r\n\r\n");
-  if (headerEnd < 0) return false;
-  const header = buf.subarray(0, headerEnd).toString("latin1");
-  const match = /content-length:\s*(\d+)/i.exec(header);
-  if (!match) return false;
-  return buf.length >= headerEnd + 4 + Number(match[1]);
+  const header = buf.subarray(0, headerEnd < 0 ? buf.length : headerEnd).toString("latin1");
+  return /^HTTP\/1\.[01] 202 /.test(header);
 }
 
 /**
@@ -437,6 +440,7 @@ function httpResponseComplete(buf: Buffer) {
  * client sees ECONNRESET after a successful admit.
  */
 async function startCommitThenResetProxy(upstreamPort: number) {
+  let sawCommitted202 = false;
   const server = net.createServer((client) => {
     const upstream = net.connect({ port: upstreamPort, host: "127.0.0.1" });
     const rstClient = () => {
@@ -451,13 +455,17 @@ async function startCommitThenResetProxy(upstreamPort: number) {
     let buf = Buffer.alloc(0);
     upstream.on("data", (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
-      if (httpResponseComplete(buf)) rstClient();
+      if (httpResponseCommitted(buf)) {
+        sawCommitted202 = true;
+        rstClient();
+      }
     });
     upstream.on("end", rstClient);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   return {
     port: (server.address() as AddressInfo).port,
+    sawCommitted202: () => sawCommitted202,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
@@ -1380,11 +1388,13 @@ async function caseIdempotentReplayCoversUnknownOutcomes() {
     check(
       "aa_tcp_proxy_reset_after_committed_202_spools_the_same_minted_id",
       Boolean(forwarded && "spooled" in forwarded) &&
+        proxy.sawCommitted202() &&
         afterReset.length === 1 &&
         typeof mintedId === "string" &&
         afterReset[0]?.id === mintedId,
       {
         forwarded,
+        sawCommitted202: proxy.sawCommitted202(),
         rowsAfterReset: afterReset.length,
         ledgerId: afterReset[0]?.id,
         mintedId,
