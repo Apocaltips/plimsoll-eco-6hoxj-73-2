@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
 import { assertManagedConfigTarget } from "./fixture-root";
+import { hookCommandHasRetryContract } from "./templates";
 
 /**
  * Config APPLY mode (issue 0003): idempotent, surgical merges of Plimsoll's
@@ -929,6 +930,7 @@ export function applyGeminiSettings(
 }
 
 const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
+const GROK_COMMAND_PREFIX = 'if [ -n "${GROK_HOOK_EVENT:-}" ]; then ';
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
 const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
 const SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
@@ -939,6 +941,13 @@ const DIRECT_GROK_COMMAND_PATTERN = new RegExp(
     String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${GROK_HEADER_FILE_WORD_PATTERN} --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true` +
     String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
 );
+
+function isRetryingGrokCommand(command: string) {
+  if (!command.startsWith(GROK_COMMAND_PREFIX) || !command.endsWith("; fi")) return false;
+  const inner = command.slice(GROK_COMMAND_PREFIX.length, -"; fi".length);
+  return hookCommandHasRetryContract(inner) &&
+    /http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok/.test(inner);
+}
 
 function isManagedGrokGroup(event: string, value: unknown) {
   if (!isJsonRecord(value)) return false;
@@ -953,7 +962,8 @@ function isManagedGrokGroup(event: string, value: unknown) {
     typeof handler.command === "string" &&
     (LEGACY_GROK_COMMAND_PATTERN.test(handler.command) ||
       VALUE_BLIND_GROK_COMMAND_PATTERN.test(handler.command) ||
-      DIRECT_GROK_COMMAND_PATTERN.test(handler.command));
+      DIRECT_GROK_COMMAND_PATTERN.test(handler.command) ||
+      isRetryingGrokCommand(handler.command));
 }
 
 function isManagedGrokDocument(value: unknown) {
@@ -988,10 +998,11 @@ function unquoteShellWord(word: string) {
 }
 
 function managedGrokExecutable(command: string) {
+  const retrying = command.match(new RegExp(String.raw`code=\$\((${SHELL_WORD_PATTERN}) -sS`));
   const direct = command.match(new RegExp(String.raw`\| (${SHELL_WORD_PATTERN}) -s`));
   const forwarded = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) --dir`));
   const legacy = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) -s`));
-  const word = direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
+  const word = retrying?.[1] ?? direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
   return word ? unquoteShellWord(word) : undefined;
 }
 
@@ -2475,6 +2486,12 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
   return { next, changes, plan };
 }
 
+export function isCodexLayoutRefusal(message: string) {
+  return /unsupported .+ layout|dotted, inline, or implicit|dotted or inline layout|complete generated subset|ambiguous layout that cannot be reconciled|without a writable table/.test(
+    message,
+  );
+}
+
 /** Reconcile Plimsoll's generated subset into an existing Codex config.toml. */
 export function applyCodexConfig(
   file: string,
@@ -2501,6 +2518,108 @@ export function applyCodexConfig(
   }
   const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
   return { path: file, changed: true, changes, plan: entries, backupPath };
+}
+
+/**
+ * Bypass for interactive Codex TOML layouts that refuse a full OTEL merge
+ * (eco-6hoxj.29). Rewrites only Plimsoll-owned `command = "..."` values that
+ * already post to `/hooks/codex`, the same way token headers were moved out of
+ * the TOML instead of forcing a whole-file rewrite.
+ */
+export function applyCodexHookCommandsOnly(
+  file: string,
+  generatedToml: string,
+  options: CodexApplyOptions = {},
+): ApplyResult {
+  assertManagedConfigTarget(file);
+  const { snapshot, current } = readCodexPreimage(file);
+  if (!snapshot.exists) {
+    return {
+      path: file,
+      changed: false,
+      changes: [],
+      plan: [],
+      conflict: `${file}: Codex hook-command bypass requires an existing config.toml.`,
+    };
+  }
+  const expected = parseDocument(file, generatedToml, true);
+  const lineEnding = detectLineEnding(file, current);
+  const lines = current.split(lineEnding);
+  const changes: string[] = [];
+  const plan: ApplyPlanEntry[] = [];
+  for (const event of HOOK_EVENTS) {
+    const expectedEntries = getPath(expected, ["hooks", event]);
+    if (!Array.isArray(expectedEntries) || expectedEntries.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} layout.`);
+    }
+    const expectedOwnedCommands = hookCommands(expectedEntries).filter(isPlimsollHookPath);
+    if (expectedOwnedCommands.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} command layout.`);
+    }
+    const ownedAssignments = scanToml(lines).assignments.filter((entry) =>
+      entry.keyPath.length === 1 &&
+      entry.keyPath[0] === "command" &&
+      typeof parsedTomlValue(entry.valueRaw) === "string" &&
+      isPlimsollHookPath(parsedTomlValue(entry.valueRaw) as string) &&
+      (
+        (entry.tableKind === "array" &&
+          entry.tablePath.length >= 2 &&
+          entry.tablePath[0] === "hooks" &&
+          entry.tablePath[1] === event) ||
+        (entry.tableKind === "table" && samePath(entry.tablePath, ["hooks"]))
+      ),
+    );
+    if (ownedAssignments.length === 0) {
+      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      continue;
+    }
+    if (ownedAssignments.length > 1) {
+      return {
+        path: file,
+        changed: false,
+        changes: [],
+        plan,
+        conflict: `${file}: hooks.${event} has more than one Plimsoll Codex command; refusing hook-command bypass.`,
+      };
+    }
+    const assignment = ownedAssignments[0]!;
+    const currentCommand = parsedTomlValue(assignment.valueRaw);
+    if (currentCommand === expectedOwnedCommands[0]) {
+      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      continue;
+    }
+    const line = lines[assignment.index]!;
+    lines[assignment.index] =
+      `${line.slice(0, assignment.valueStart)}${JSON.stringify(expectedOwnedCommands[0])}${line.slice(assignment.valueEnd)}`;
+    changes.push(`hooks.${event} update generated Plimsoll command hook`);
+    plan.push({ key: `hooks.${event}`, action: "updated" });
+  }
+  const next = lines.join(lineEnding);
+  if (changes.length === 0) return { path: file, changed: false, changes: [], plan };
+  if (options.dryRun) return { path: file, changed: true, changes, plan };
+  const backupPath = writeCodexPlan(file, snapshot, current, next, options.transactionHooks);
+  return { path: file, changed: true, changes, plan, backupPath };
+}
+
+/** Full Codex apply, falling back to hook-command rewrite on a layout refusal. */
+export function applyCodexConfigOrHookCommands(
+  file: string,
+  generatedToml: string,
+  options: CodexApplyOptions = {},
+): ApplyResult {
+  try {
+    const result = applyCodexConfig(file, generatedToml, options);
+    if (result.conflict && isCodexLayoutRefusal(result.conflict)) {
+      return applyCodexHookCommandsOnly(file, generatedToml, options);
+    }
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isCodexLayoutRefusal(message)) {
+      return applyCodexHookCommandsOnly(file, generatedToml, options);
+    }
+    throw error;
+  }
 }
 
 export type CodexHookCommandDiagnostic = {
