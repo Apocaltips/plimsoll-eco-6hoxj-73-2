@@ -35,6 +35,10 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- A managed-config reconcile that loses the state-file lock still writes its
+  apply/refuse receipt; the stamp, backoff map and backup record retry on the
+  next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner
+  cannot fail a yield that already holds.
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never
