@@ -25,15 +25,12 @@ import {
  * fail-closed semantics) as a `kind: "session_sync"` batch.
  *
  * Invariants (the upload-history house rules):
- * - The ledger is opened strictly READ-ONLY (or borrowed from the daemon's
- *   live handle for the 5-minute-sync path — reads only). Nothing here marks
- *   rows or touches collector.config.json.
- * - Idempotency comes from deterministic session ids, not local state: the
- *   cloud upserts by id with a grow-only guard, so re-sending the same
- *   snapshots updates rows in place with identical values — run twice over
- *   the same --until, nothing changes (the cloud reports what it did:
- *   inserted/updated/skippedStale). No resume watermark: the whole walk is
- *   cheap (thousands of sessions, not hundreds of thousands of events).
+ * - Event rows are never marked. The daemon's live handle is borrowed for
+ *   snapshot reads; it also stores one `maintenance_state` horizon row so a
+ *   restart can catch up without `upload-history --sessions`.
+ * - Idempotency comes from deterministic session ids: the cloud upserts by
+ *   id with a grow-only guard, so re-sending the same snapshots updates rows
+ *   in place. The daemon horizon only remembers which local walk succeeded.
  * - Privacy parity: only canonical linkage hashes, privacy-safe actor aliases
  *   and typed counters cross. Raw non-UUID session ids are deterministically
  *   replaced and never leave the machine. The shared outbound sealer runs
@@ -101,8 +98,10 @@ export function collectSessionSnapshots(
   ledger: Database.Database,
   options: { until: string; sessionIds?: string[] },
 ): SessionSnapshot[] {
-  // SQLite caps bind variables (999 on conservative builds). A daemon cycle
-  // can touch up to 5×500 events; chunk the id filter well under the cap.
+  // An explicit empty id list is "send nothing", never an omitted filter
+  // (omitting sessionIds is the full walk). SQLite caps bind variables
+  // (999 on conservative builds); chunk well under that cap.
+  if (options.sessionIds && options.sessionIds.length === 0) return [];
   if (options.sessionIds && options.sessionIds.length > 400) {
     const out: SessionSnapshot[] = [];
     for (let start = 0; start < options.sessionIds.length; start += 400) {
@@ -368,10 +367,10 @@ export function saveDaemonSessionSyncState(
   state: DaemonSessionSyncState,
 ): void {
   ensureSessionSyncStateTable(db);
-  const pendingSessionIds = sanitizeSessionIds(state.pendingSessionIds) ?? [];
+  const pendingSessionIds = sanitizeSessionIds(state.pendingSessionIds);
   const record: DaemonSessionSyncState =
-    pendingSessionIds.length > MAX_PENDING_SESSION_IDS
-      ? { ...emptyDaemonSessionSyncState(), lastSuccessfulUntil: state.lastSuccessfulUntil }
+    pendingSessionIds === null
+      ? emptyDaemonSessionSyncState()
       : {
           schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
           caughtUp: Boolean(state.caughtUp),

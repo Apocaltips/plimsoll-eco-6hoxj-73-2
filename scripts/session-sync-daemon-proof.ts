@@ -4,6 +4,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
+  collectSessionSnapshots,
   commitDaemonSessionSyncFailure,
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
@@ -16,7 +17,7 @@ import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("session-sync-daemon", 10);
+const completion = createProofCompletion("session-sync-daemon", 13);
 const root = process.env.PLIMSOLL_PROOF_ROOT!;
 const installKey = "session-sync-daemon-proof-key";
 const tenantId = "00000000-0000-4000-8000-000000000070";
@@ -234,6 +235,25 @@ async function main() {
         otlpPlan.sessionIds?.includes(otlpSession) === true &&
         otlpPlan.skip === false,
     );
+
+    const horizon = loadDaemonSessionSyncState(incremental.database).lastSuccessfulUntil;
+    const failedIncremental = await daemonCycle(incremental, {
+      until: nowIso(),
+      fetchImpl: ingestFetch({ failTimes: 1, sent: [] }),
+    });
+    completion.check(
+      "incremental_failure_keeps_horizon",
+      failedIncremental.result?.ok === false &&
+        failedIncremental.state.caughtUp === true &&
+        failedIncremental.state.lastSuccessfulUntil === horizon,
+    );
+    completion.check(
+      "empty_session_id_filter_is_zero_snapshots_not_a_full_walk",
+      collectSessionSnapshots(incremental.database, {
+        until: nowIso(),
+        sessionIds: [],
+      }).length === 0,
+    );
   } finally {
     incremental.close();
   }
@@ -264,6 +284,17 @@ async function main() {
       "corrupt_state_degrades_to_full_catchup",
       degraded.caughtUp === false && plan.reason === "full_catchup",
     );
+    saveDaemonSessionSyncState(corrupt.database, {
+      schemaVersion: 1,
+      caughtUp: true,
+      lastSuccessfulUntil: nowIso(),
+      pendingSessionIds: ["x".repeat(200)],
+    });
+    const overflow = loadDaemonSessionSyncState(corrupt.database);
+    completion.check(
+      "oversized_pending_save_drops_horizon",
+      overflow.caughtUp === false && overflow.pendingSessionIds.length === 0,
+    );
   } finally {
     corrupt.close();
   }
@@ -278,7 +309,10 @@ async function main() {
       cliSource.includes("loadDaemonSessionSyncState") &&
       cliSource.includes("saveDaemonSessionSyncState") &&
       cliSource.includes("if (serverRetryAfterMs > 0) { carrySessions(); return; }") &&
-      cliSource.includes("const touchedSessionIds ="),
+      cliSource.includes("const touchedSessionIds =") &&
+      cliSource.indexOf("const touchedSessionIds =") >
+        cliSource.indexOf("if (serverRetryAfterMs > 0) { carrySessions(); return; }") &&
+      /try \{\s*const sessionPlan = planDaemonSessionSync/.test(cliSource),
   );
 
   completion.complete();
