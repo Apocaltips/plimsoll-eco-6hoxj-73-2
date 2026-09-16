@@ -555,7 +555,10 @@ directory that exists with no config file in it yet is reported as
 `skipped: absent` rather than created. A run that applied or
 refused something writes `<collector home>/receipts/managed-config-reconcile-<ts>.json`
 with the per-target status, plan lines and backups; a healthy home plans every
-target `unchanged` and writes nothing at all. The running collector calls the
+target `unchanged` and writes nothing at all. The receipt is written before the
+state-file lock, so a lock timeout cannot swallow an apply that already
+happened — the stamp, backoff map and backup record retry on the next tick.
+The running collector calls the
 same reconcile in-process every `managedConfig.reconcile.intervalSeconds`
 (default 600), and only when its own doctor readback reports at least one
 drifted target, so a healthy host does zero writes; the tick yields to the event
@@ -590,7 +593,10 @@ credentials manages no targets at all and stamps `lastResult: "unavailable"`
 instead, so it does not read as a healthy host. The state file is read and
 written under the same cross-process mutation lock the collector config uses, so
 an operator's `setup --reconcile` and a daemon tick cannot drop each other's
-backoff entries or run stamp.
+backoff entries or run stamp. The lock covers that stamp write, not a whole
+run: a backoff another process arms while this run is already in flight can be
+planned once more than the hour implies, then the merged write keeps both
+decisions.
 
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
