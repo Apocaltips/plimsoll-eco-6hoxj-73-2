@@ -28,6 +28,12 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- `forward-hook-http` mints a stable event id before the first attempt so a
+  spool replay after a connection reset, a closed socket, or a request timeout
+  cannot double-count the event. The client now spools those unknown-outcome
+  classes as well as 503, 408, and ECONNREFUSED. A body that already carries a
+  UUID is unchanged; a body with no id still gets a fresh UUID on the
+  collector's own intake.
 - Automatic maintenance now keeps committed progress across deadlines, bounds
   cursor and enrichment work, and reaps disposable workers before replacement.
 - Maintenance worker startup is separated from ledger initialization and has a
